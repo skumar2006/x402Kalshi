@@ -1,0 +1,26 @@
+{
+  "trades": [
+    {
+      "timestamp": "2025-12-25T12:32:25.971495",
+      "agent_id": "dummy-agent-1",
+      "contract_ticker": "KXSENATEMED-26-GRA",
+      "quantity": 1,
+      "side": "yes",
+      "trade_id": "96c1e7c5-f0f5-43ae-b5cb-167c4b1733ca",
+      "price": 0.56,
+      "total_cost": 0.56
+    }
+  ],
+  "agents": {
+    "dummy-agent-1": [
+      {
+        "contract": "KXSENATEMED-26-GRA",
+        "quantity": 1,
+        "side": "yes",
+        "trade_id": "96c1e7c5-f0f5-43ae-b5cb-167c4b1733ca",
+        "price": 0.56,
+        "timestamp": "2025-12-25T12:32:25.971495"
+      }
+    ]
+  }
+}

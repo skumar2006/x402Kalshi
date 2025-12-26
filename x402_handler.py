@@ -1,6 +1,8 @@
 from flask import Response
 from typing import Optional
 import requests
+import hashlib
+import time
 
 class X402Handler:
     """
@@ -13,32 +15,51 @@ class X402Handler:
     
     def require_payment(self, amount_usd: float, currency: str = "USDC", 
                        recipient_address: str = None, memo: str = "", 
-                       chain: str = "ethereum") -> Response:
+                       chain: str = "ethereum", escrow_address: str = None,
+                       trade_hash: str = None) -> Response:
         """
         Returns HTTP 402 response with PAYMENT-REQUIRED header
         
-        Format: PAYMENT-REQUIRED: amount=1.5;currency=USDC;address=0x...;chain=base;memo=...
+        Format: PAYMENT-REQUIRED: amount=1.5;currency=USDC;address=0x...;recipient=0x...;chain=base;trade_hash=0x...;memo=...
         
         Args:
             amount_usd: Payment amount in USD
             currency: Currency code (default: USDC)
-            recipient_address: x402 payment address (uses default if not provided)
+            recipient_address: Final recipient address (who gets funds after trade)
             memo: Payment memo/description
             chain: Blockchain network (ethereum, base, polygon, arbitrum)
+            escrow_address: Escrow contract address (if provided, used as address)
+            trade_hash: Trade hash for escrow (if escrow is used)
         
         Returns:
             Flask Response with 402 status and PAYMENT-REQUIRED header
         """
-        address = recipient_address or self.recipient_address or "DEFAULT_X402_ADDRESS"
+        # If escrow is provided, escrow contract is the address to send to
+        # recipient_address is who gets funds after successful trade
+        if escrow_address:
+            address = escrow_address  # Send to escrow contract
+            final_recipient = recipient_address or self.recipient_address
+        else:
+            address = recipient_address or self.recipient_address or "DEFAULT_X402_ADDRESS"
+            final_recipient = address
         
         # Format PAYMENT-REQUIRED header according to x402 spec
         payment_header = (
             f"amount={amount_usd};"
             f"currency={currency};"
-            f"address={address};"
+            f"address={address};"  # Where to send (escrow contract or direct)
             f"chain={chain};"
-            f"memo={memo}"
         )
+        
+        # Add recipient if different from address (for escrow)
+        if escrow_address and final_recipient != address:
+            payment_header += f"recipient={final_recipient};"
+        
+        # Add trade hash if provided (for escrow)
+        if trade_hash:
+            payment_header += f"trade_hash={trade_hash};"
+        
+        payment_header += f"memo={memo}"
         
         response = Response(
             status=402,

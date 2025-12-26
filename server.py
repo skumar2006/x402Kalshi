@@ -2,9 +2,13 @@ from flask import Flask, request, jsonify
 from price_checker import KalshiPriceChecker
 from trade_executor import KalshiTradeExecutor
 from x402_handler import X402Handler
+from escrow_handler import EscrowHandler
 from ledger import Ledger
 import os
 from dotenv import load_dotenv
+import binascii
+import time
+import hashlib
 
 load_dotenv()
 
@@ -41,6 +45,22 @@ x402_handler = X402Handler(
     recipient_address=os.getenv("X402_RECIPIENT_ADDRESS")
 )
 ledger = Ledger()
+
+# Initialize escrow handler if contract address is provided
+escrow_address = os.getenv("ESCROW_CONTRACT_ADDRESS")
+escrow_handler = None
+if escrow_address:
+    edge_service_private_key = os.getenv("EDGE_SERVICE_PRIVATE_KEY")
+    if not edge_service_private_key:
+        print("WARNING: ESCROW_CONTRACT_ADDRESS set but EDGE_SERVICE_PRIVATE_KEY missing. Escrow disabled.")
+    else:
+        chain = os.getenv("X402_CHAIN", "ethereum")
+        escrow_handler = EscrowHandler(
+            escrow_address=escrow_address,
+            private_key=edge_service_private_key,
+            chain=chain
+        )
+        print(f"Escrow enabled: {escrow_address} on {chain}")
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -107,24 +127,84 @@ def execute_trade():
         # No payment yet - return 402
         memo = f"Kalshi trade: {contract_ticker} {side} x{quantity}"
         chain = os.getenv("X402_CHAIN", "ethereum")  # Default to ethereum
+        escrow_address = os.getenv("ESCROW_CONTRACT_ADDRESS")
+        
+        # Generate trade hash if using escrow
+        trade_hash = None
+        if escrow_address:
+            trade_data = f"{agent_id}:{contract_ticker}:{quantity}:{side}:{time.time()}"
+            trade_hash_bytes = hashlib.sha256(trade_data.encode()).digest()[:32]
+            trade_hash = "0x" + trade_hash_bytes.hex()
+            
+            # Store trade hash for later verification (could use a simple cache/dict)
+            # For now, we'll regenerate it during verification
+        
         return x402_handler.require_payment(
             amount_usd=required_payment,
             currency="USDC",
             recipient_address=os.getenv("X402_RECIPIENT_ADDRESS"),
             memo=memo,
-            chain=chain
+            chain=chain,
+            escrow_address=escrow_address,
+            trade_hash=trade_hash
         )
     
     # Step 4: Verify payment
     recipient_address = os.getenv("X402_RECIPIENT_ADDRESS")
     chain = os.getenv("X402_CHAIN", "ethereum")
-    if not x402_handler.verify_payment(payment_signature, required_payment, 
-                                       currency="USDC", recipient_address=recipient_address,
-                                       chain=chain):
-        return jsonify({
-            "error": "Payment verification failed",
-            "required_amount": required_payment
-        }), 402
+    
+    # Check if payment_signature looks like a trade hash (64 hex chars) or tx hash
+    is_trade_hash = len(payment_signature.replace('0x', '')) == 64
+    
+    if escrow_handler and is_trade_hash:
+        # Verify escrow deposit using trade hash
+        try:
+            trade_hash_bytes = bytes.fromhex(payment_signature.replace('0x', ''))
+            if len(trade_hash_bytes) != 32:
+                return jsonify({
+                    "error": "Invalid trade hash format",
+                    "required_amount": required_payment
+                }), 402
+            
+            exists, trade_info = escrow_handler.verify_deposit(trade_hash_bytes)
+            if not exists:
+                return jsonify({
+                    "error": "Escrow deposit not found",
+                    "required_amount": required_payment
+                }), 402
+            
+            # Verify amount matches
+            if abs(trade_info["amount"] - required_payment) > 0.01:
+                return jsonify({
+                    "error": f"Amount mismatch: escrow has {trade_info['amount']}, need {required_payment}",
+                    "required_amount": required_payment
+                }), 402
+            
+            # Verify recipient matches
+            if trade_info["recipient"].lower() != recipient_address.lower():
+                return jsonify({
+                    "error": "Recipient mismatch",
+                    "required_amount": required_payment
+                }), 402
+            
+            print(f"Escrow deposit verified: {trade_info['amount']} USDC from {trade_info['agent']}")
+        except Exception as e:
+            print(f"Error verifying escrow deposit: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "error": f"Escrow verification failed: {e}",
+                "required_amount": required_payment
+            }), 402
+    else:
+        # Fallback to direct payment verification (legacy)
+        if not x402_handler.verify_payment(payment_signature, required_payment, 
+                                           currency="USDC", recipient_address=recipient_address,
+                                           chain=chain):
+            return jsonify({
+                "error": "Payment verification failed",
+                "required_amount": required_payment
+            }), 402
     
     # Step 5: Execute trade
     trade_id = trade_executor.execute_trade(
@@ -135,12 +215,40 @@ def execute_trade():
     )
     
     if not trade_id:
+        # Trade failed - refund escrow if using escrow
+        is_trade_hash = len(payment_signature.replace('0x', '')) == 64
+        if escrow_handler and is_trade_hash:
+            try:
+                trade_hash_bytes = bytes.fromhex(payment_signature.replace('0x', ''))
+                refund_tx = escrow_handler.refund_funds(trade_hash_bytes)
+                print(f"Trade failed - refunded escrow: {refund_tx}")
+            except Exception as refund_error:
+                print(f"ERROR: Trade failed and refund failed: {refund_error}")
+                import traceback
+                traceback.print_exc()
+                # Log for manual review
+        
         return jsonify({
             "error": "Trade execution failed",
-            "contract": contract_ticker
+            "contract": contract_ticker,
+            "refunded": escrow_handler is not None and is_trade_hash
         }), 500
     
-    # Step 6: Record in ledger
+    # Step 6: Release escrow funds (if using escrow)
+    is_trade_hash = len(payment_signature.replace('0x', '')) == 64
+    if escrow_handler and is_trade_hash:
+        try:
+            trade_hash_bytes = bytes.fromhex(payment_signature.replace('0x', ''))
+            release_tx = escrow_handler.release_funds(trade_hash_bytes, trade_id)
+            print(f"Released escrow funds: {release_tx}")
+        except Exception as release_error:
+            print(f"ERROR: Failed to release escrow: {release_error}")
+            import traceback
+            traceback.print_exc()
+            # Trade succeeded but release failed - log for manual review
+            # Could implement retry logic here
+    
+    # Step 7: Record in ledger
     payment_signature = request.headers.get("PAYMENT-SIGNATURE")
     ledger.record_trade(
         agent_id=agent_id,

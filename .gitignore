@@ -37,3 +37,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Node.js / Hardhat
+node_modules/
+contracts/node_modules/
+contracts/artifacts/
+contracts/cache/
+

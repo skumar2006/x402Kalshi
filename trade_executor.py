@@ -5,6 +5,7 @@ import time
 import hmac
 import hashlib
 import base64
+import os
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.backends import default_backend
@@ -113,6 +114,13 @@ class KalshiTradeExecutor:
         Returns:
             order_id or None if error
         """
+        # Test mode: Simulate trade failure for testing refund flow
+        # This allows price checking and deposit to proceed, but fails at execution
+        if os.getenv("SIMULATE_TRADE_FAILURE", "false").lower() == "true":
+            print("⚠️  SIMULATE_TRADE_FAILURE enabled - simulating trade failure for testing refund flow")
+            print(f"   Would have executed: {contract_ticker} {side} x{quantity} @ {price}")
+            return None
+        
         # Convert price to cents (Kalshi uses 0-100 scale)
         price_cents = int(price * 100)
         
